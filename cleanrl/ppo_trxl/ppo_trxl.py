@@ -768,13 +768,13 @@ if __name__ == "__main__":
         ent_coef = (args.init_ent_coef - args.final_ent_coef) * frac + args.final_ent_coef
 
         # Init episodic memory buffer using each environments' current episodic memory
-        # todo 这里在干嘛？备份存储记忆
+        # todo 这里在干嘛？按照环境的顺序存储每个环境的记忆
         stored_memories = [next_memory[e] for e in range(args.num_envs)]
         # 这边应该是设置环境的id
         for e in range(args.num_envs):
             stored_memory_index[:, e] = e
 
-        # t里在干嘛？ 收集ppo的训练轨迹
+        # 收集ppo的训练轨迹
         for step in range(args.num_steps):
             # 因为有num_envs个环境，所以每执行一步都相当于走了num_envs步
             global_step += args.num_envs
