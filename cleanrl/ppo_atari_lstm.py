@@ -156,14 +156,26 @@ class Agent(nn.Module):
         self.critic = layer_init(nn.Linear(128, 1), std=1)
 
     def get_states(self, x, lstm_state, done):
+        '''
+        x: 当前的环境观察数据
+        lstm_state: lstm的状态，这个lstm的状态需要手动维护
+        done: 当前的环境是否结束
+        '''
+        # 提取特征
         hidden = self.network(x / 255.0)
 
-        # LSTM logic
+        # LSTM logic 也就是环境的数量
         batch_size = lstm_state[0].shape[1]
+        # 上面特征提取以后的hidden的shape必须是[batch_size, 512]，而batch_size是环境的数量
+        # -1的维度应该是环境的步数 
+        # 在最开始时，传入的步数时1步
         hidden = hidden.reshape((-1, batch_size, self.lstm.input_size))
         done = done.reshape((-1, batch_size))
-        new_hidden = []
+        new_hidden = [] # 存储lstm每个环境步的预测输出，可以从历史步的环境状态和当前步的环境状态进行计算
+        # 按照环境的步数进行循环迭代
         for h, d in zip(hidden, done):
+            # 1 - 0 的意思是当前的环境没有结束，如果环境结束则值为0，那么传入的隐藏层状态也为0，表示不进行计算
+            # lstm_state仅存储最后的状态，表示LSTM的最新的状态
             h, lstm_state = self.lstm(
                 h.unsqueeze(0),
                 (
@@ -172,15 +184,36 @@ class Agent(nn.Module):
                 ),
             )
             new_hidden += [h]
+        # 将每个环境状态的步的预测输出进行拼接返回
         new_hidden = torch.flatten(torch.cat(new_hidden), 0, 1)
         return new_hidden, lstm_state
 
     def get_value(self, x, lstm_state, done):
+        '''
+        x: 当前的环境观察数据
+        lstm_state: lstm的状态，这个lstm的状态需要手动维护
+        done: 当前的环境是否结束
+        '''
         hidden, _ = self.get_states(x, lstm_state, done)
         return self.critic(hidden)
 
     def get_action_and_value(self, x, lstm_state, done, action=None):
+        '''
+        x: 当前的环境观察数据
+        lstm_state: lstm的状态，这个lstm的状态需要手动维护
+        done: 当前的环境是否结束
+        action: 当前的动作，可以是None不传入动作
+
+        return: 
+        action: 当前的动作/或者预测的动作
+        probs.log_prob(action): 当前动作的概率log
+        probs.entropy(): 当前动作的熵
+        self.critic(hidden): 当前动作的价值
+        lstm_state: lstm的状态，这个lstm的状态需要手动维护
+        '''
+        # 获取历史环境步的状态和当前步的环境状态提取的特征，LSTM的最新的状态
         hidden, lstm_state = self.get_states(x, lstm_state, done)
+        # 利用提取的特征进行动作的预测动作
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
@@ -232,11 +265,11 @@ if __name__ == "__main__":
     # ALGO Logic: Storage setup
     # 这种形式的话，应该返回的观察数据是连续的
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device) # 执行的动作
+    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device) # 执行动作的log概率
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values = torch.zeros((args.num_steps, args.num_envs)).to(device) # 环境当前所处与价值函数的值
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -268,17 +301,22 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
+                # SyncVectorEnv 环境 reset返回的状体啊的维度是[env_num, 4, 84, 84]
+                # next_done维度是[env_num]
+                # 这边每次传入的都是一个时间步的数据
                 action, logprob, _, value, next_lstm_state = agent.get_action_and_value(next_obs, next_lstm_state, next_done)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
+            # 执行，并搜集环境数据
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
+            # 这块没有不记录
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
@@ -288,13 +326,22 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            # 计算最后一个时间步的状态的价值
             next_value = agent.get_value(
                 next_obs,
                 next_lstm_state,
                 next_done,
             ).reshape(1, -1)
+            # 优势函数存储缓冲区 初始化为0
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
+            # 逆序计算时间步
+            # nextnonterminal： 1表示当前的环境没有结束，0表示当前的环境已经结束
+            # nextvalues：当前时间步的环境的价值
+            # delta：当前时间步的环境的奖励 + gamma * 下一个时间步的环境的价值 * nextnonterminal - 当前时间步的环境的价值，当前时间步的环境的价值
+            # advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+            # 这里的advantages是一个时间步的环境的优势函数时间上的累积
+            # returns = advantages + values 表示bellman方程的计算的价值值
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
@@ -306,7 +353,7 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # flatten the batch
+        # flatten the batch 展平
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
@@ -317,37 +364,49 @@ if __name__ == "__main__":
 
         # Optimizing the policy and value network
         assert args.num_envs % args.num_minibatches == 0
-        envsperbatch = args.num_envs // args.num_minibatches
-        envinds = np.arange(args.num_envs)
-        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
+        envsperbatch = args.num_envs // args.num_minibatches # 每轮训练的小循环内部将训练的数据分为几个环境batch组合
+        envinds = np.arange(args.num_envs) # 环境的ID
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs) # 在代码刚开始时就设置了=args.num_envs * args.num_steps 这里应该是构建索引
+        # 代表着所有采集数据的索引id，然后在训练时从中随机抽取id进行训练
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(envinds)
+            np.random.shuffle(envinds) # 打乱环境的顺序
             for start in range(0, args.num_envs, envsperbatch):
                 end = start + envsperbatch
-                mbenvinds = envinds[start:end]
+                mbenvinds = envinds[start:end] # 获取本轮训练的所选取的对应环境的id
+                # ravel()：将多维数组展平为一维数组
+                # 这里是按照环境的ID进行索引，所以训练的数据是连续的（对应每一个环境）
                 mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
-
+                
                 _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
-                    b_obs[mb_inds],
-                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]),
+                    b_obs[mb_inds], # 选择对应环境的连续观察数据
+                    (initial_lstm_state[0][:, mbenvinds], initial_lstm_state[1][:, mbenvinds]), # 选择对应环境的lstm状态
                     b_dones[mb_inds],
                     b_actions.long()[mb_inds],
                 )
+
+                # 计算最新模型的动作的log概率 和 旧模型的动作的log概率的比率差值
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
+                # 这里是测量新旧策略之间的差异，防止过大的差异
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
+                    # 是新旧策略之间的近似 KL 散度（Kullback-Leibler Divergence）
+                    old_approx_kl = (-logratio).mean() 
+                    # 是另一种近似 KL 散度的计算方式  KL ≈ (ratio - 1) - log(ratio)，同样用于衡量新旧策略的差异
                     approx_kl = ((ratio - 1) - logratio).mean()
+                    # 判断 ratio 是否超出了裁剪范围 [1 - clip_coef, 1 + clip_coef]。
+                    # 统计超出裁剪范围的比例
+                    # 如果 clipfracs 比例过高，说明裁剪限制了大部分更新，可能需要调整超参数（如 clip_coef）
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
+                # 获取对应环境的优势函数并进行标准化
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
+                # Policy loss 计算动作优势损失
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
@@ -355,18 +414,26 @@ if __name__ == "__main__":
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
+                    # 如果开启了裁剪价值损失
+                    # v_loss_unclipped：未裁剪的价值损失
+                    # v_clipped：裁剪后的价值损失，裁剪的方法就是将旧值加上 （新旧差值的裁剪），模拟模型预测的新值
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(
                         newvalue - b_values[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
                     )
+                    # 然后将裁剪的价值损失和未裁剪的价值损失进行比较，取较大值
+                    # TODO 这里还是不太明白
+                    # 我自己的理解就是：类似价值的熵，训练预测的价值接近真实的价值，但是又不能过于接近
+                    # 否则会导致模型过拟合，所以这里的裁剪就是为了防止模型过拟合才使用torch.max选择更大的值
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
+                # 动作的熵损失，避免动作过拟合
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
@@ -375,11 +442,26 @@ if __name__ == "__main__":
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
+            # 如果训练时新旧差异过则不进行训练
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
-
+        
+        # y_pred 预测的价值
+        # y_true 真实的价值
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        # 真实价值的方差
         var_y = np.var(y_true)
+        # var_y == 0：表示所有的值都相同，那么说明计算的价值有问题
+        # explained_var：解释方差，表示模型预测的价值和真实价值之间的相关性
+        # 1.0: 完美预测，值函数完全准确
+        # 0.0: 预测效果等同于始终预测平均值
+        # < 0: 预测效果比预测平均值还差
+        '''
+        当 var_y = 0 时返回 np.nan，说明所有回报值都相同，这种情况可能表示：
+        环境奖励设计过于简单
+        训练出现问题    
+        奖励信号异常
+        '''
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
