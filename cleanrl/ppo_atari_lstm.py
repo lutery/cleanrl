@@ -87,6 +87,18 @@ class Args:
 
 
 def make_env(env_id, idx, capture_video, run_name):
+    '''
+    1. 记录视频
+    2. RecordEpisodeStatistics：记录每个episode的统计信息，包含奖励、长度等
+    3. NoopResetEnv：在环境重置时，随机执行0到noop_max之间的no-op动作
+    4. MaxAndSkipEnv：跳帧
+    5. EpisodicLifeEnv：将游戏的一条生命视为一个episode游戏周期
+    6. FireResetEnv：在环境重置时，执行FIRE动作，有些游戏需要执行Fire才会开始游戏
+    7. ClipRewardEnv: 奖励裁剪，限制到 Bin reward to {+1, 0, -1} by its sign.
+    8. ResizeObservation：将观察空间的图像大小调整为指定的大小 84 * 84
+    9. GrayScaleObservation: 将RGB转换为灰度图
+    10. FrameStack：帧堆叠，这里的1应该是不采用帧堆叠
+    '''
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
@@ -117,6 +129,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
+        # 卷积+MLP层：最终输出512的维度
         self.network = nn.Sequential(
             layer_init(nn.Conv2d(1, 32, 8, stride=4)),
             nn.ReLU(),
@@ -128,12 +141,17 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
+        # LSTM层 输出128维度
         self.lstm = nn.LSTM(512, 128)
+        # 初始化
         for name, param in self.lstm.named_parameters():
             if "bias" in name:
                 nn.init.constant_(param, 0)
             elif "weight" in name:
                 nn.init.orthogonal_(param, 1.0)
+
+        # 根据LSTM层的输出，进行动作的预测和奖励的预测
+        # 如果是共用，那么动作的维度和奖励的维度应该尽可能的接近，否则可能会有问题
         self.actor = layer_init(nn.Linear(128, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(128, 1), std=1)
 
@@ -212,6 +230,7 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
+    # 这种形式的话，应该返回的观察数据是连续的
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -225,6 +244,8 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    # 需要记录LSTM层的状态
+    # todo 为什么会有两层 ，可以放在agent里面
     next_lstm_state = (
         torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
         torch.zeros(agent.lstm.num_layers, args.num_envs, agent.lstm.hidden_size).to(device),
@@ -233,11 +254,13 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_iterations + 1):
         initial_lstm_state = (next_lstm_state[0].clone(), next_lstm_state[1].clone())
         # Annealing the rate if instructed to do so.
+        # 学习率更新
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # 每次训练收集的数据长度
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
